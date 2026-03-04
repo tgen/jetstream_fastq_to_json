@@ -20,8 +20,9 @@ def parse_arguments():
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
 
     parser.add_argument('-n', '--name', default="EXAMPLE", help='Name of the json to generate, also becomes the name of the project when submitted')
-    parser.add_argument('-i', '--input', nargs='+', default=currentDirectory, help='Input directory and prefix of fastqs to process, ', metavar='/path/to/input_fastqs')
+    parser.add_argument('-i', '--input', nargs='+', default=currentDirectory, help='Input directory and prefix of files to process, ', metavar='/path/to/input_fastqs')
     parser.add_argument('-rp', '--readPattern', default='*R1*.fastq.gz', help='Glob pattern for R1 fastqs, R2 will simply replace R1 with R2 in this pattern, default = *R1*.fastq.gz', metavar='readPattern')
+    parser.add_argument('-nr2', '--noRead2', default=False, action='store_true', help='Skip creation of R2 records in the json, e.g. input is single-ended or does not follow readPattern')
     parser.add_argument('-o', '--output', default=currentDirectory, help='Output directory to place the name.json', metavar='/path/to/output/directory')
     parser.add_argument('-t', '--template', help='Path to a template json to copy task configuration from', metavar='/path/to/template.json')
     parser.add_argument('-s', '--study', default="STUDY", help='Name of the study, e.g. MMRF, C4RCD, TCL, etc', metavar='STUDY')
@@ -29,8 +30,8 @@ def parse_arguments():
     parser.add_argument('-m', '--model', help='Platform model the data is from, defaults to NovaSeq6000', metavar='PlatformModel')
     parser.add_argument('-a', '--assay', help='If defined, this assayCode will be used for all data_files', metavar='ASSAY')
     parser.add_argument('-ap', '--assayPattern', help='Glob pattern to use for assigning an assayCode, assignment is split on "=", example: K1ID2="*_ID2_*",KHWGS="*_WGS_*"', metavar='assayPattern')
-    parser.add_argument('-af', '--assayField', help='Assuming the fastq naming scheme is uniform, what field(s) should be used for assigning assayCode.\n'
-                        'For example to extract ASSAY from STUDY_PATIENT_VISIT_SOURCE_FRACTION_SubgroupIncrement_ASSAY_LIBRARY.fastq.gz we would use: 7', metavar='assayField')
+    parser.add_argument('-af', '--assayField', help='Assuming the file naming scheme is uniform, what field(s) should be used for assigning assayCode.\n'
+                        'For example to extract ASSAY from STUDY_PATIENT_VISIT_SOURCE_FRACTION_SubgroupIncrement_ASSAY_LIBRARY_R1.fastq.gz we would use: 7', metavar='assayField')
     parser.add_argument('-gp', '--glprep', help='If defined, glPrep of all data_files, Genome, Capture, or RNA in most cases', metavar='glPrep')
     parser.add_argument('-gpp', '--glprepPattern', help='Glob pattern to use for assigning glPrep, assignment is split on "="\n'
                         'For example: Genome="*WGS*",Capture="*WES*"', metavar='glprepPattern')
@@ -68,6 +69,9 @@ def parse_arguments():
     parser.add_argument('--centro', default=centro_url, help=f'URL to submit the json to if --submit is enabled, defaults to {centro_url}', metavar='centro_url')
     parser.add_argument('--netrc', help='Path a netrc formatted file for authentication with the centro server', metavar='/path/to/netrc')
     parser.add_argument('--dryRun', default=False, action='store_true', help='Mock the submission to centro, but generate the complete json.')
+    parser.add_argument('--bam', default=False, action='store_true', help='Process bam files instead of fastqs, and treat them as ALIGNED files')
+    parser.add_argument('--ubam', default=False, action='store_true', help='Process bam files instead of fastqs, and treat them as UNALIGNED files')
+    parser.add_argument('-ct', '--copyTemplate', default=False, action='store_true', help='Copy all definitions from the template, useful for custom options per pipeline')
 
     # prints help message when 0 arguments are entered
     if len(sys.argv) == 1:
@@ -102,21 +106,21 @@ def longestCommonPrefix(strs):
     return strs[0][0:length].rstrip('_')
 
 
-def find_fastqs_in_dir(input, readPattern):
-    fastq_list = []
+def find_files_in_dir(input, readPattern):
+    file_list = []
     for dir in input:
-        fastq_list += glob.glob(f'{dir}{readPattern}')
-    if len(fastq_list) == 0:
-        raise RuntimeError(f'No fastqs found in {input}')
-    return fastq_list
+        file_list += glob.glob(f'{dir}{readPattern}')
+    if len(file_list) == 0:
+        raise RuntimeError(f'No files matching the expected pattern were found in {input}')
+    return file_list
 
 
-def get_pattern_match(fastq, pattern, fallback, default):
+def get_pattern_match(file, pattern, fallback, default):
     if pattern is not None:
         pattern = pattern.rstrip() + ','
         pattern_dict = dict(p.split("=")[::-1] for p in pattern.split(",") if p != '')
         for key, value in pattern_dict.items():
-            if fnmatch.fnmatch(fastq, key):
+            if fnmatch.fnmatch(file, key):
                 return value
     if fallback is not None:
         return fallback
@@ -126,7 +130,7 @@ def get_pattern_match(fastq, pattern, fallback, default):
         return None
 
 
-def get_selected_fields(fastq, fields, resplit):
+def get_selected_fields(file, fields, resplit):
     fields = fields + ','
     fields_list = []
     for i in filter(None, fields.split(",")):
@@ -135,7 +139,7 @@ def get_selected_fields(fastq, fields, resplit):
             fields_list.extend(range(int(s) - 1, int(e)))
         else:
             fields_list.append(int(i) - 1)
-    extracted_fields = list(map(re.split(resplit, fastq).__getitem__, fields_list))
+    extracted_fields = list(map(re.split(resplit, file).__getitem__, fields_list))
     return '_'.join(extracted_fields)
 
 
@@ -151,6 +155,36 @@ def get_line_count(fastq):
         count = sum(buf.count(b"\n") for buf in _make_gen(f.read))
     return count
 
+def create_data_files_from_bams(file_list, args):
+    data_files = []
+    if len(file_list) > 1:
+        sampleName = longestCommonPrefix(list(map(os.path.basename, file_list)))
+    else:
+        sampleName = args.name
+    for file in file_list:
+        print(f'parsing bam: {file}')
+        file_dict = {}
+
+        file_dict['assayCode'] = get_selected_fields(os.path.basename(file), args.assayField, args.resplit) if args.assayField else get_pattern_match(file, args.assayPattern, args.assay, 'KHWGS')
+        file_dict['path'] = file
+        file_dict['fileType'] = 'ubam' if args.ubam else 'bam'
+        file_dict['glPrep'] = get_pattern_match(file, args.glprepPattern, args.glprep, 'Genome')
+        file_dict['glType'] = get_pattern_match(file, args.gltypePattern, args.gltype, 'Genome')
+        file_dict['rgcn'] = args.center if args.center else 'TGen'
+        file_dict['rgpl'] = 'ILLUMINA'
+        file_dict['rgpm'] = args.model if args.model else 'NovaSeq6000'
+        file_dict['rgid'] = get_selected_fields(os.path.basename(file), args.rgsmField, args.resplit) if args.rgsmField else args.rgsm if args.rgsm else sampleName
+        file_dict['rgsm'] = get_selected_fields(os.path.basename(file), args.rgsmField, args.resplit) if args.rgsmField else args.rgsm if args.rgsm else sampleName
+        file_dict['rglb'] = get_selected_fields(os.path.basename(file), args.rglbField, args.resplit) if args.rglbField else args.rglb if args.rglb else sampleName
+        if args.dnaRnaMergeKey or args.dnaRnaMergeKeyField:
+            file_dict['dnaRnaMergeKey'] = get_selected_fields(os.path.basename(file), args.dnaRnaMergeKeyField, args.resplit) if args.dnaRnaMergeKeyField else args.dnaRnaMergeKey
+        if args.sampleMergeKey or args.sampleMergeKeyField:
+            file_dict['sampleMergeKey'] = get_selected_fields(os.path.basename(file), args.sampleMergeKeyField, args.resplit) if args.sampleMergeKeyField else args.sampleMergeKey
+        file_dict['sampleName'] = get_selected_fields(os.path.basename(file), args.sampleNameField, args.resplit) if args.sampleNameField else args.sampleName if args.sampleName else sampleName
+        file_dict['subGroup'] = get_pattern_match(file, args.subgroupPattern, args.subgroup, 'Constitutional')
+        data_files.append(file_dict)
+
+    return data_files
 
 def create_data_files_from_fastqs(fastq_list, args):
     data_files = []
@@ -181,8 +215,11 @@ def create_data_files_from_fastqs(fastq_list, args):
         fastq_dict['lane'] = "1" if args.dummy else first_line.split(':')[3]
         if not args.noCompute:
             fastq_dict['numberOfReads'] = int(count / 2)
-        fastq_dict['read1Length'] = int(subprocess.check_output(f"zcat {fastq} | head -n 1000 | wc -L", shell=True).decode('utf-8').rstrip())
-        fastq_dict['read2Length'] = fastq_dict['read1Length']
+            fastq_dict['read1Length'] = int(subprocess.check_output(f"zcat {fastq} | head -n 1000 | wc -L", shell=True).decode('utf-8').rstrip())
+            fastq_dict['read2Length'] = fastq_dict['read1Length']
+        else:
+            fastq_dict['read1Length'] = 150
+            fastq_dict['read2Length'] = fastq_dict['read1Length']
         fastq_dict['rgcn'] = args.center if args.center else 'TGen'
         fastq_dict['rgpl'] = 'ILLUMINA'
         fastq_dict['rgpm'] = args.model if args.model else 'NovaSeq6000'
@@ -198,12 +235,13 @@ def create_data_files_from_fastqs(fastq_list, args):
         fastq_dict['sampleName'] = get_selected_fields(os.path.basename(fastq), args.sampleNameField, args.resplit) if args.sampleNameField else args.sampleName if args.sampleName else sampleName
         fastq_dict['subGroup'] = get_pattern_match(fastq, args.subgroupPattern, args.subgroup, 'Constitutional')
         data_files.append(fastq_dict)
-        # Duplicate the entry for R2
-        fastq_dict_r2 = fastq_dict.copy()
-        fastq_dict_r2['fastqCode'] = 'R2'
-        # We only want to replace the last R1 with R2, otherwise we would use a simple str.replace()
-        fastq_dict_r2['fastqPath'] = 'R2'.join(fastq.rsplit('R1', 1))
-        data_files.append(fastq_dict_r2)
+        if not args.noRead2:
+            # Duplicate the entry for R2
+            fastq_dict_r2 = fastq_dict.copy()
+            fastq_dict_r2['fastqCode'] = 'R2'
+            # We only want to replace the last R1 with R2, otherwise we would use a simple str.replace()
+            fastq_dict_r2['fastqPath'] = 'R2'.join(fastq.rsplit('R1', 1))
+            data_files.append(fastq_dict_r2)
 
     return data_files
 
@@ -212,9 +250,19 @@ def main():
     # Parse and validate arguments
     args = parse_arguments()
 
-    fastq_list = find_fastqs_in_dir(args.input, args.readPattern)
+    if args.bam or args.ubam:
+        args.readPattern = "*.bam"
+        args.noRead2 = True
+        args.noCompute = True
+        args.dummy = True
+
+    file_list = find_files_in_dir(args.input, args.readPattern)
     output_json = f"{args.output}/{args.name}.json"
-    data_files = create_data_files_from_fastqs(fastq_list, args)
+
+    if args.bam:
+        data_files = create_data_files_from_bams(file_list, args)
+    else:
+        data_files = create_data_files_from_fastqs(file_list, args)
 
     template = None
     if args.template:
@@ -238,6 +286,9 @@ def main():
     output_dict['study'] = args.study
     output_dict['studyDisease'] = ""
     output_dict['tasks'] = template['tasks'] if template is not None else ""
+    if args.copyTemplate and template is not None:
+        for k, v in template.items():
+            output_dict[k] = v
 
     with open(output_json, 'w') as output_file:
         json.dump(output_dict, output_file, indent=2)
